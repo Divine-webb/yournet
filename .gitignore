@@ -1,3 +1,6 @@
 .env
 node_modules
 yournet.db
+yournet.db-shm
+yournet.db-wal
+.DS_Store
