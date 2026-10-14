@@ -16,7 +16,11 @@ const PORT = Number(process.env.PORT || 3000);
 const JWT_SECRET =
   process.env.JWT_SECRET || 'change-this-secret-before-production';
 
-const db = new Database('yournet.db');
+// DB_PATH lets this point at a persistent volume (e.g. on Railway) instead
+// of the app's own ephemeral filesystem, which gets wiped on every
+// redeploy. Locally, with no DB_PATH set, it just uses the project folder
+// as before.
+const db = new Database(process.env.DB_PATH || 'yournet.db');
 
 db.pragma('journal_mode=WAL');
 
