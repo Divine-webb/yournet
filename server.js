@@ -12,6 +12,13 @@ import { mikrotikOnActivate, mikrotikOnSuspend, mikrotikOnReconnect, mikrotikOnE
 dotenv.config();
 
 const app = express();
+
+// Railway (and most hosts) sit the app behind a proxy that adds an
+// X-Forwarded-For header with the visitor's real IP. Without this line,
+// express-rate-limit refuses to trust that header and throws
+// ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on every request. "1" means trust
+// exactly one hop of proxy (Railway's own), which is correct here.
+app.set('trust proxy', 1);
 const PORT = Number(process.env.PORT || 3000);
 const JWT_SECRET =
   process.env.JWT_SECRET || 'change-this-secret-before-production';
