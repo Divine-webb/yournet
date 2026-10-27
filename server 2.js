@@ -115,6 +115,10 @@ if (!userColumns.includes('hotspot_password')) {
   db.exec(`ALTER TABLE users ADD COLUMN hotspot_password TEXT`);
 }
 
+if (!userColumns.includes('provisional')) {
+  db.exec(`ALTER TABLE users ADD COLUMN provisional INTEGER NOT NULL DEFAULT 0`);
+}
+
 // Phone needs to be unique once it's used for login, same as email.
 db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone ON users(phone)`);
 
@@ -695,6 +699,10 @@ function adminHTML() {
     Customers
   </button>
 
+  <button onclick="tab('payments',this)">
+    Payments
+  </button>
+
   <button onclick="tab('settings',this)">
     Settings
   </button>
@@ -1025,6 +1033,14 @@ async function showAccount(account) {
       </div>\`
     : ''}
 
+  \${user.status === 'ACTIVE' && user.provisional
+    ? \`<div class="notice" style="border:1px solid #ffb347;">
+        Temporary access while we confirm your transfer. If it's not
+        confirmed in time, access will pause until it is — no action
+        needed from you, just wait for confirmation.
+      </div>\`
+    : ''}
+
 </div>
 
 \${user.status !== 'ACTIVE'
@@ -1084,11 +1100,29 @@ async function showAccount(account) {
           Pay & activate
         </button>
 
+        <button
+          class="quiet"
+          style="background:transparent;color:#3d8bff;border:1px solid #3d8bff;"
+          onclick="manualPay('\${esc(plan.id)}')"
+        >
+          I've paid by transfer
+        </button>
+
       </div>
 
     \`).join('')}
 
   </div>
+
+  \${(config.settings.bank || config.settings.accountNumber)
+    ? \`<div class="notice">
+        Transfer to: <b>\${esc(config.settings.bank)}</b>,
+        \${esc(config.settings.accountName)} —
+        <b>\${esc(config.settings.accountNumber)}</b>.
+        Then click "I've paid by transfer" on your plan and enter the
+        reference. You'll be connected right away, pending confirmation.
+      </div>\`
+    : ''}
 
 </div>
 
@@ -1162,9 +1196,38 @@ async function pay(planId) {
 
 }
 
+async function manualPay(planId) {
+
+  const reference = prompt(
+    "Enter your transfer reference or transaction ID:"
+  );
+
+  if (!reference) return;
+
+  try {
+
+    const result = await api(
+      '/api/payments/manual-claim',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ planId, reference })
+      }
+    );
+
+    alert(result.message || 'Submitted. You are provisionally connected.');
+    location.reload();
+
+  } catch (error) {
+    alert(error.message);
+  }
+
+}
+
 window.register = register;
 window.login = login;
 window.pay = pay;
+window.manualPay = manualPay;
 
 boot();
 
@@ -1293,6 +1356,10 @@ async function tab(name, button) {
 
   if (name === 'users') {
     return users();
+  }
+
+  if (name === 'payments') {
+    return payments();
   }
 
   if (name === 'settings') {
@@ -1755,6 +1822,115 @@ async function act(id, action) {
 }
 
 // ============================================================
+// PAYMENTS (manual transfer claims)
+// ============================================================
+
+async function payments() {
+
+  const result =
+    await api('/api/admin/payments/pending');
+
+  document.getElementById(
+    'adminApp'
+  ).innerHTML = \`
+
+<div class="card">
+
+  <h2>
+    Pending manual payments
+  </h2>
+
+  <p class="muted">
+    Check your bank/OPay app for each reference, then confirm or
+    reject. Confirming gives the full plan. Rejecting cuts access
+    right away. Unconfirmed claims expire on their own after
+    30 minutes.
+  </p>
+
+  \${result.payments.length === 0
+    ? '<p class="muted">Nothing pending right now.</p>'
+    : \`<div class="table">
+
+    <table>
+
+      <tr>
+        <th>Name</th>
+        <th>Room</th>
+        <th>Plan</th>
+        <th>Amount</th>
+        <th>Reference</th>
+        <th>Submitted</th>
+        <th>Actions</th>
+      </tr>
+
+      \${result.payments.map(payment => \`
+
+        <tr>
+
+          <td>\${esc(payment.name)}</td>
+          <td>\${esc(payment.room)}</td>
+          <td>\${esc(payment.plan_name || '-')}</td>
+          <td>₦\${Number(payment.amount).toLocaleString()}</td>
+          <td>\${esc(payment.reference)}</td>
+          <td>\${esc(payment.created_at)}</td>
+
+          <td>
+            <button
+              class="green"
+              onclick="confirmPayment(\${payment.id})"
+            >
+              Confirm
+            </button>
+
+            <button
+              class="danger"
+              onclick="rejectPayment(\${payment.id})"
+            >
+              Reject
+            </button>
+          </td>
+
+        </tr>
+
+      \`).join('')}
+
+    </table>
+
+  </div>\`}
+
+</div>
+
+\`;
+
+}
+
+async function confirmPayment(id) {
+
+  await api(
+    '/api/admin/payments/' + id + '/confirm',
+    { method: 'POST' }
+  );
+
+  payments();
+
+}
+
+async function rejectPayment(id) {
+
+  if (!confirm('Reject this payment? The customer will be disconnected immediately.')) {
+    return;
+  }
+
+  await api(
+    '/api/admin/payments/' + id + '/reject',
+    { method: 'POST' }
+  );
+
+  payments();
+
+}
+
+// ============================================================
 // SETTINGS
 // ============================================================
 
@@ -1936,6 +2112,8 @@ window.tab = tab;
 window.savePlan = savePlan;
 window.createPlan = createPlan;
 window.act = act;
+window.confirmPayment = confirmPayment;
+window.rejectPayment = rejectPayment;
 window.saveSettings = saveSettings;
 window.publish = publish;
 
@@ -2350,7 +2528,8 @@ app.get(
             expiry,
             usage_mb,
             created_at,
-            hotspot_password
+            hotspot_password,
+            provisional
           FROM users
           WHERE id=?
         `)
@@ -3009,7 +3188,7 @@ app.post(
       // ------------------------------------------------------
 
       if (
-        provider ===
+        provider.toLowerCase() ===
           'paystack' &&
         process.env
           .PAYSTACK_SECRET_KEY
@@ -3100,6 +3279,265 @@ app.post(
       });
 
     }
+
+  }
+);
+
+// ============================================================
+// MANUAL PAYMENT CLAIM (OPay / bank transfer / Paystack fallback)
+// ============================================================
+//
+// For when a customer pays outside Paystack (OPay, bank transfer), or
+// Paystack's webhook is slow/down. They submit a reference, get
+// PROVISIONAL (temporary) access right away so they're not stuck
+// waiting, and admin must confirm within the window below or it
+// automatically reverts — same expiry loop that handles normal plans
+// handles this too, no extra code needed for the revert itself.
+
+const PROVISIONAL_MINUTES = 30;
+
+app.post(
+  '/api/payments/manual-claim',
+  auth('customer'),
+  (req, res) => {
+
+    try {
+
+      const plan =
+        db
+          .prepare(`
+            SELECT * FROM plans
+            WHERE id=? AND enabled=1
+          `)
+          .get(req.body.planId);
+
+      if (!plan) {
+        return res.status(400).json({
+          error: 'Invalid plan'
+        });
+      }
+
+      const reference =
+        String(req.body.reference || '').trim();
+
+      if (!reference) {
+        return res.status(400).json({
+          error: 'Enter your payment reference or transaction ID'
+        });
+      }
+
+      const user =
+        db
+          .prepare('SELECT * FROM users WHERE id=?')
+          .get(req.user.sub);
+
+      const paymentReference =
+        'MANUAL-' + crypto.randomUUID();
+
+      const provisionalExpiry =
+        new Date(
+          Date.now() + PROVISIONAL_MINUTES * 60000
+        ).toISOString();
+
+      db.transaction(() => {
+
+        db
+          .prepare(`
+            INSERT INTO payments(
+              reference, user_id, plan_id, amount,
+              provider, status, created_at
+            )
+            VALUES(?,?,?,?,?,?,?)
+          `)
+          .run(
+            paymentReference,
+            user.id,
+            plan.id,
+            plan.price,
+            'manual: ' + reference,
+            'PENDING',
+            now()
+          );
+
+        db
+          .prepare(`
+            UPDATE users
+            SET status='ACTIVE', plan_id=?, expiry=?, provisional=1
+            WHERE id=?
+          `)
+          .run(plan.id, provisionalExpiry, user.id);
+
+      })();
+
+      // Connect them on the router right away — if this isn't
+      // confirmed in time, the normal expiry loop will disconnect
+      // them automatically, same as any other expired plan.
+      mikrotikOnActivate({
+        username: user.username,
+        password: user.hotspot_password,
+        profile: plan.mikrotik_profile || plan.id,
+        expiry: new Date(provisionalExpiry)
+      }).catch((error) => {
+        console.error('Mikrotik activate (manual claim) failed:', error.message);
+      });
+
+      res.json({
+        ok: true,
+        message:
+          'Provisional access granted for ' + PROVISIONAL_MINUTES +
+          ' minutes while we confirm your payment.'
+      });
+
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({
+        error: 'Could not submit payment claim'
+      });
+    }
+
+  }
+);
+
+// ============================================================
+// ADMIN: PENDING MANUAL PAYMENTS
+// ============================================================
+
+app.get(
+  '/api/admin/payments/pending',
+  auth('admin'),
+  (req, res) => {
+
+    const payments =
+      db
+        .prepare(`
+          SELECT
+            p.id, p.reference, p.amount, p.created_at,
+            u.id AS user_id, u.name, u.room, u.phone, u.username,
+            u.expiry, u.provisional,
+            pl.name AS plan_name
+          FROM payments p
+          JOIN users u ON u.id = p.user_id
+          LEFT JOIN plans pl ON pl.id = p.plan_id
+          WHERE p.status='PENDING' AND p.provider LIKE 'manual:%'
+          ORDER BY p.created_at DESC
+        `)
+        .all();
+
+    res.json({ payments });
+
+  }
+);
+
+app.post(
+  '/api/admin/payments/:id/confirm',
+  auth('admin'),
+  (req, res) => {
+
+    const payment =
+      db
+        .prepare('SELECT * FROM payments WHERE id=?')
+        .get(req.params.id);
+
+    if (!payment || payment.status !== 'PENDING') {
+      return res.status(404).json({
+        error: 'Pending payment not found'
+      });
+    }
+
+    const plan =
+      db.prepare('SELECT * FROM plans WHERE id=?').get(payment.plan_id);
+
+    const user =
+      db.prepare('SELECT * FROM users WHERE id=?').get(payment.user_id);
+
+    if (!plan || !user) {
+      return res.status(404).json({ error: 'Plan or customer not found' });
+    }
+
+    // Give them the real, full plan duration from now — the
+    // provisional window was just a holding pattern.
+    const realExpiry =
+      new Date(Date.now() + durationMs(plan.duration_value, plan.duration_unit))
+        .toISOString();
+
+    db.transaction(() => {
+
+      db
+        .prepare(`UPDATE payments SET status='PAID', paid_at=? WHERE id=?`)
+        .run(now(), payment.id);
+
+      db
+        .prepare(`
+          UPDATE users
+          SET status='ACTIVE', expiry=?, provisional=0
+          WHERE id=?
+        `)
+        .run(realExpiry, user.id);
+
+    })();
+
+    mikrotikOnActivate({
+      username: user.username,
+      password: user.hotspot_password,
+      profile: plan.mikrotik_profile || plan.id,
+      expiry: new Date(realExpiry)
+    }).catch((error) => {
+      console.error('Mikrotik activate (confirm) failed:', error.message);
+    });
+
+    audit(req, 'payment.confirm', { id: payment.id });
+
+    res.json({ ok: true });
+
+  }
+);
+
+app.post(
+  '/api/admin/payments/:id/reject',
+  auth('admin'),
+  (req, res) => {
+
+    const payment =
+      db
+        .prepare('SELECT * FROM payments WHERE id=?')
+        .get(req.params.id);
+
+    if (!payment || payment.status !== 'PENDING') {
+      return res.status(404).json({
+        error: 'Pending payment not found'
+      });
+    }
+
+    const user =
+      db.prepare('SELECT * FROM users WHERE id=?').get(payment.user_id);
+
+    db.transaction(() => {
+
+      db
+        .prepare(`UPDATE payments SET status='FAILED' WHERE id=?`)
+        .run(payment.id);
+
+      if (user) {
+        db
+          .prepare(`
+            UPDATE users
+            SET status='EXPIRED', provisional=0
+            WHERE id=?
+          `)
+          .run(user.id);
+      }
+
+    })();
+
+    if (user) {
+      mikrotikOnSuspend(user.username).catch((error) => {
+        console.error('Mikrotik suspend (reject) failed:', error.message);
+      });
+    }
+
+    audit(req, 'payment.reject', { id: payment.id });
+
+    res.json({ ok: true });
 
   }
 );
