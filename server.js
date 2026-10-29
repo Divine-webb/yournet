@@ -1849,54 +1849,47 @@ async function payments() {
 
   \${result.payments.length === 0
     ? '<p class="muted">Nothing pending right now.</p>'
-    : \`<div class="table">
+    : result.payments.map(payment => \`
 
-    <table>
+      <div class="plan">
 
-      <tr>
-        <th>Name</th>
-        <th>Room</th>
-        <th>Plan</th>
-        <th>Amount</th>
-        <th>Reference</th>
-        <th>Submitted</th>
-        <th>Actions</th>
-      </tr>
+        <h3>
+          \${esc(payment.name)} · Room \${esc(payment.room)}
+        </h3>
 
-      \${result.payments.map(payment => \`
+        <p>
+          <b>\${esc(payment.plan_name || '-')}</b>
+          · ₦\${Number(payment.amount).toLocaleString()}
+        </p>
 
-        <tr>
+        <p>
+          Reference they entered:
+          <b>\${esc(String(payment.provider || '').replace('manual: ', ''))}</b>
+        </p>
 
-          <td>\${esc(payment.name)}</td>
-          <td>\${esc(payment.room)}</td>
-          <td>\${esc(payment.plan_name || '-')}</td>
-          <td>₦\${Number(payment.amount).toLocaleString()}</td>
-          <td>\${esc(payment.reference)}</td>
-          <td>\${esc(payment.created_at)}</td>
+        <p class="muted">
+          Submitted \${new Date(payment.created_at).toLocaleString()}
+          · Temporary access ends
+          \${payment.expiry ? new Date(payment.expiry).toLocaleTimeString() : '-'}
+        </p>
 
-          <td>
-            <button
-              class="green"
-              onclick="confirmPayment(\${payment.id})"
-            >
-              Confirm
-            </button>
+        <button
+          class="green"
+          onclick="confirmPayment(\${payment.id})"
+        >
+          Confirm
+        </button>
 
-            <button
-              class="danger"
-              onclick="rejectPayment(\${payment.id})"
-            >
-              Reject
-            </button>
-          </td>
+        <button
+          class="danger"
+          onclick="rejectPayment(\${payment.id})"
+        >
+          Reject
+        </button>
 
-        </tr>
+      </div>
 
-      \`).join('')}
-
-    </table>
-
-  </div>\`}
+    \`).join('')}
 
 </div>
 
@@ -3411,7 +3404,7 @@ app.get(
       db
         .prepare(`
           SELECT
-            p.id, p.reference, p.amount, p.created_at,
+            p.id, p.reference, p.provider, p.amount, p.created_at,
             u.id AS user_id, u.name, u.room, u.phone, u.username,
             u.expiry, u.provisional,
             pl.name AS plan_name
