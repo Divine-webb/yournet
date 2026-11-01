@@ -888,6 +888,13 @@ function showAuth() {
     Login
   </button>
 
+  <button
+    onclick="showForgot()"
+    style="background:transparent;color:#3d8bff;border:1px solid #3d8bff;"
+  >
+    Forgot password?
+  </button>
+
   <p
     id="msg"
     class="muted"
@@ -1224,10 +1231,202 @@ async function manualPay(planId) {
 
 }
 
+// ---------- Forgot password ----------
+
+let resetIdentifier = '';
+
+function showForgot() {
+
+  // Carry over whatever they already typed in the login box.
+  const typed =
+    $('#le') ? $('#le').value : '';
+
+  $('#app').innerHTML = \`
+
+<div class="card">
+
+  <h1>
+    Reset your password
+  </h1>
+
+  <p class="muted">
+    Enter the email or phone number on your account. We'll email a
+    6-digit code to the email address on file.
+  </p>
+
+  <div class="grid">
+
+    <label>
+      Email or phone number
+      <input id="fi">
+    </label>
+
+  </div>
+
+  <button onclick="sendCode()">
+    Send code
+  </button>
+
+  <button
+    onclick="showAuth()"
+    style="background:transparent;color:#3d8bff;border:1px solid #3d8bff;"
+  >
+    Back to login
+  </button>
+
+  <p
+    id="msg"
+    class="muted"
+  ></p>
+
+</div>
+
+\`;
+
+  $('#fi').value = typed;
+
+}
+
+async function sendCode() {
+
+  const identifier =
+    $('#fi').value.trim();
+
+  if (!identifier) {
+    $('#msg').textContent =
+      'Enter your email or phone number.';
+    return;
+  }
+
+  $('#msg').textContent = 'Sending...';
+
+  try {
+
+    const result =
+      await api(
+        '/api/auth/forgot',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({ identifier })
+        }
+      );
+
+    resetIdentifier = identifier;
+
+    showReset(result.message);
+
+  } catch (error) {
+
+    $('#msg').textContent = error.message;
+
+  }
+
+}
+
+function showReset(message) {
+
+  $('#app').innerHTML = \`
+
+<div class="card">
+
+  <h1>
+    Enter your code
+  </h1>
+
+  <p class="muted">
+    \${esc(message || 'We sent a 6-digit code to your email.')}
+  </p>
+
+  <div class="grid">
+
+    <label>
+      6-digit code
+      <input
+        id="rc"
+        inputmode="numeric"
+        maxlength="6"
+        autocomplete="one-time-code"
+      >
+    </label>
+
+    <label>
+      New password
+      <input
+        id="rp"
+        type="password"
+        minlength="8"
+        autocomplete="new-password"
+      >
+    </label>
+
+  </div>
+
+  <button onclick="resetPassword()">
+    Reset password
+  </button>
+
+  <button
+    onclick="showForgot()"
+    style="background:transparent;color:#3d8bff;border:1px solid #3d8bff;"
+  >
+    Send a new code
+  </button>
+
+  <p
+    id="msg"
+    class="muted"
+  ></p>
+
+</div>
+
+\`;
+
+}
+
+async function resetPassword() {
+
+  try {
+
+    await api(
+      '/api/auth/reset',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          identifier: resetIdentifier,
+          code: $('#rc').value.trim(),
+          newPassword: $('#rp').value
+        })
+      }
+    );
+
+    showAuth();
+
+    $('#msg').style.color = '#2fe6a5';
+    $('#msg').textContent =
+      'Password changed. You can log in now.';
+
+  } catch (error) {
+
+    $('#msg').textContent = error.message;
+
+  }
+
+}
+
 window.register = register;
 window.login = login;
 window.pay = pay;
 window.manualPay = manualPay;
+window.showAuth = showAuth;
+window.showForgot = showForgot;
+window.sendCode = sendCode;
+window.resetPassword = resetPassword;
 
 boot();
 
@@ -2474,6 +2673,310 @@ app.post(
     res.json({
       ok: true
     });
+
+  }
+);
+
+// ============================================================
+// FORGOT PASSWORD (6-digit code sent by email)
+// ============================================================
+//
+// How it works:
+//  1. Customer asks for a reset -> we make a random 6-digit code,
+//     store only a scrambled (hashed) copy, and email the real code.
+//  2. Customer types the code + a new password -> we compare, and
+//     the code is deleted so it can only ever be used once.
+//
+// Safety rules built in: codes expire after 10 minutes, 5 wrong
+// guesses kills the code, and you can't request a new one more
+// than once a minute.
+//
+// Email goes out through a small Google Apps Script "relay" over
+// HTTPS (see EMAIL_WEBHOOK_URL / EMAIL_WEBHOOK_SECRET). We use that
+// instead of Gmail SMTP because Railway blocks SMTP on the Trial
+// and Hobby plans.
+
+const RESET_CODE_MINUTES = 10;
+const RESET_MAX_ATTEMPTS = 5;
+const RESET_COOLDOWN_SECONDS = 60;
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS password_resets(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    code_hash TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+  )
+`);
+
+function findUserByIdentifier(identifier) {
+  const asEmail = String(identifier || '').trim().toLowerCase();
+  const asPhone = normalizePhone(identifier);
+  return db
+    .prepare("SELECT * FROM users WHERE email=? OR (phone=? AND ? != '')")
+    .get(asEmail, asPhone, asPhone);
+}
+
+function hashResetCode(userId, code) {
+  return crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(userId + ':' + code)
+    .digest('hex');
+}
+
+function emailIsConfigured() {
+  return Boolean(
+    process.env.EMAIL_WEBHOOK_URL &&
+    process.env.EMAIL_WEBHOOK_SECRET
+  );
+}
+
+// Makes a fresh code for this user. Returns { code } or { wait: true }
+// if they asked too recently.
+function issueResetCode(userId) {
+
+  db.prepare('DELETE FROM password_resets WHERE expires_at < ?')
+    .run(now());
+
+  const latest =
+    db
+      .prepare(`
+        SELECT created_at FROM password_resets
+        WHERE user_id=? ORDER BY id DESC LIMIT 1
+      `)
+      .get(userId);
+
+  if (
+    latest &&
+    Date.now() - Date.parse(latest.created_at) <
+      RESET_COOLDOWN_SECONDS * 1000
+  ) {
+    return { wait: true };
+  }
+
+  // Only one live code per person: a new one replaces the old one.
+  db.prepare('DELETE FROM password_resets WHERE user_id=?').run(userId);
+
+  const code =
+    String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+
+  db
+    .prepare(`
+      INSERT INTO password_resets(
+        user_id, code_hash, expires_at, attempts, created_at
+      )
+      VALUES(?,?,?,0,?)
+    `)
+    .run(
+      userId,
+      hashResetCode(userId, code),
+      new Date(Date.now() + RESET_CODE_MINUTES * 60000).toISOString(),
+      now()
+    );
+
+  return { code };
+
+}
+
+// True only if the code is right, unexpired, and not guessed out.
+// A correct code is deleted straight away (one use only).
+function checkResetCode(userId, code) {
+
+  const row =
+    db
+      .prepare(`
+        SELECT * FROM password_resets
+        WHERE user_id=? ORDER BY id DESC LIMIT 1
+      `)
+      .get(userId);
+
+  if (
+    !row ||
+    Date.parse(row.expires_at) < Date.now() ||
+    row.attempts >= RESET_MAX_ATTEMPTS
+  ) {
+    return false;
+  }
+
+  const given =
+    Buffer.from(hashResetCode(userId, String(code).trim()), 'hex');
+
+  const wanted =
+    Buffer.from(row.code_hash, 'hex');
+
+  const matches =
+    given.length === wanted.length &&
+    crypto.timingSafeEqual(given, wanted);
+
+  if (!matches) {
+    db
+      .prepare('UPDATE password_resets SET attempts = attempts + 1 WHERE id=?')
+      .run(row.id);
+    return false;
+  }
+
+  db.prepare('DELETE FROM password_resets WHERE user_id=?').run(userId);
+
+  return true;
+
+}
+
+async function sendResetEmail(to, code) {
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+
+  try {
+
+    const response =
+      await fetch(
+        process.env.EMAIL_WEBHOOK_URL,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            secret: process.env.EMAIL_WEBHOOK_SECRET,
+            to,
+            code,
+            minutes: RESET_CODE_MINUTES,
+            business: getSetting('businessName') || 'Yournet'
+          }),
+          signal: controller.signal
+        }
+      );
+
+    const result =
+      await response.json().catch(() => null);
+
+    if (!response.ok || !result || result.ok !== true) {
+      throw new Error(
+        'Email relay said no (HTTP ' + response.status + '): ' +
+        ((result && result.error) || 'no valid reply — check the script is deployed for "Anyone"')
+      );
+    }
+
+  } finally {
+    clearTimeout(timer);
+  }
+
+}
+
+// Shared by both reset endpoints. Generous because everyone in the
+// compound reaches the site from the same public IP.
+const resetLimiter =
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      error: 'Too many attempts. Please wait a few minutes and try again.'
+    }
+  });
+
+app.post(
+  '/api/auth/forgot',
+  resetLimiter,
+  async (req, res) => {
+
+    try {
+
+      if (!emailIsConfigured()) {
+        return res.status(503).json({
+          error:
+            'Password reset by email is not set up yet. Please message us on WhatsApp: ' +
+            (getSetting('whatsapp') || 'support') + '.'
+        });
+      }
+
+      // Same answer whether or not the account exists, so nobody
+      // can use this form to find out who is registered.
+      const generic = {
+        ok: true,
+        message:
+          'If that account exists, we sent a 6-digit code to its email address. It expires in ' +
+          RESET_CODE_MINUTES + ' minutes.'
+      };
+
+      const user = findUserByIdentifier(req.body.identifier);
+
+      if (!user || !user.email) {
+        return res.json(generic);
+      }
+
+      const issued = issueResetCode(user.id);
+
+      if (issued.wait) {
+        return res.status(429).json({
+          error: 'A code was just sent. Please wait a minute before asking for another.'
+        });
+      }
+
+      try {
+        await sendResetEmail(user.email, issued.code);
+      } catch (error) {
+        db.prepare('DELETE FROM password_resets WHERE user_id=?').run(user.id);
+        console.error('Reset email failed:', error.message);
+        return res.status(502).json({
+          error: "We couldn't send the email right now. Please try again in a few minutes."
+        });
+      }
+
+      res.json(generic);
+
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: 'Could not start password reset' });
+    }
+
+  }
+);
+
+app.post(
+  '/api/auth/reset',
+  resetLimiter,
+  async (req, res) => {
+
+    try {
+
+      const code = String(req.body.code || '').trim();
+      const newPassword = String(req.body.newPassword || '');
+
+      // Check the easy things first so a typo doesn't use up a guess.
+      if (!/^\d{6}$/.test(code)) {
+        return res.status(400).json({
+          error: 'Enter the 6-digit code from your email.'
+        });
+      }
+
+      if (newPassword.length < 8) {
+        return res.status(400).json({
+          error: 'Your new password must be at least 8 characters.'
+        });
+      }
+
+      const user = findUserByIdentifier(req.body.identifier);
+
+      if (!user || !checkResetCode(user.id, code)) {
+        return res.status(400).json({
+          error: 'That code is wrong or has expired. Please request a new one.'
+        });
+      }
+
+      const passwordHash = await bcrypt.hash(newPassword, 12);
+
+      db
+        .prepare('UPDATE users SET password_hash=? WHERE id=?')
+        .run(passwordHash, user.id);
+
+      res.json({ ok: true });
+
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ error: 'Could not reset password' });
+    }
 
   }
 );
