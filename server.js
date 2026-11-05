@@ -1919,6 +1919,15 @@ async function users() {
     Customers
   </h2>
 
+  <p class="muted">
+    Router last checked in:
+    <b>
+      \${result.routerLastSync
+        ? Math.max(0, Math.round((Date.now() - Date.parse(result.routerLastSync)) / 60000)) + ' min ago'
+        : 'never (router not connected yet)'}
+    </b>
+  </p>
+
   <div class="table">
 
     <table>
@@ -2982,6 +2991,119 @@ app.post(
 );
 
 // ============================================================
+// ROUTER SYNC (the MikroTik asks us who should be online)
+// ============================================================
+//
+// Why the router calls US instead of us calling the router: the
+// router sits behind Airtel's network, which the internet can't
+// reach into. But the router can always reach OUT. So every minute
+// it fetches this list and makes itself match it. If the router was
+// off for an hour, it simply catches up on the next check — no
+// retry queue needed.
+//
+// We send plain DATA, never commands, so even a tampered reply
+// can't make the router run anything.
+//
+// Format, one item per line:
+//   YOURNET-SYNC-1
+//   P,<profile>,<devices>                       sets "shared users" on that plan's profile
+//   U,<username>,<password>,<profile>,<1 or 0>  1 = allowed online, 0 = cut off
+//   END
+// The router ignores the reply unless it starts and ends correctly,
+// so a half-downloaded or error page can never change anything.
+
+const SAFE_FIELD = /^[A-Za-z0-9._-]{1,64}$/;
+
+function routerKeyMatches(provided) {
+  const expected = process.env.ROUTER_SYNC_KEY || '';
+  if (!expected || !provided) return false;
+  const a = crypto.createHash('sha256').update(String(provided)).digest();
+  const b = crypto.createHash('sha256').update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+
+function buildRouterSyncText() {
+
+  const lines = ['YOURNET-SYNC-1'];
+
+  const profileOf = new Map();
+
+  for (const plan of db.prepare('SELECT id, devices, mikrotik_profile FROM plans').all()) {
+    const profile = plan.mikrotik_profile || plan.id;
+    profileOf.set(plan.id, profile);
+    if (SAFE_FIELD.test(profile)) {
+      lines.push('P,' + profile + ',' + Math.max(1, Math.round(Number(plan.devices) || 1)));
+    }
+  }
+
+  const users =
+    db
+      .prepare(`
+        SELECT username, hotspot_password, plan_id, status, expiry
+        FROM users
+        WHERE plan_id IS NOT NULL
+          AND username IS NOT NULL
+          AND hotspot_password IS NOT NULL
+        ORDER BY id
+      `)
+      .all();
+
+  for (const user of users) {
+
+    const profile = profileOf.get(user.plan_id);
+
+    if (
+      !profile ||
+      !SAFE_FIELD.test(profile) ||
+      !SAFE_FIELD.test(user.username) ||
+      !SAFE_FIELD.test(user.hotspot_password)
+    ) {
+      continue;
+    }
+
+    const online =
+      user.status === 'ACTIVE' &&
+      Boolean(user.expiry) &&
+      Date.parse(user.expiry) > Date.now();
+
+    lines.push(
+      ['U', user.username, user.hotspot_password, profile, online ? 1 : 0].join(',')
+    );
+
+  }
+
+  lines.push('END');
+
+  return lines.join('\n') + '\n';
+
+}
+
+app.get(
+  '/api/router/sync',
+  (req, res) => {
+
+    res.set('Cache-Control', 'no-store');
+
+    if (!process.env.ROUTER_SYNC_KEY) {
+      return res.status(503).type('text/plain').send('router sync not configured\n');
+    }
+
+    if (!routerKeyMatches(req.get('X-Router-Key'))) {
+      return res.status(401).type('text/plain').send('unauthorized\n');
+    }
+
+    try {
+      setSetting('routerLastSync', now());
+      res.type('text/plain').send(buildRouterSyncText());
+    } catch (error) {
+      console.error(error);
+      res.status(500).type('text/plain').send('error\n');
+    }
+
+  }
+);
+
+// ============================================================
 // LOGOUT
 // ============================================================
 
@@ -3468,7 +3590,8 @@ app.get(
         .all();
 
     res.json({
-      users
+      users,
+      routerLastSync: getSetting('routerLastSync')
     });
 
   }
